@@ -39,7 +39,7 @@ BEGIN
         ed.content,
         ed.metadata,
         1 - (ed.embedding <=> query_embedding) AS similarity
-    FROM embedded_documents END
+    FROM embedded_documents ed
     WHERE 
         ed.document_id = ANY(doc_uuid_array)
     ORDER BY ed.embedding <=> query_embedding
