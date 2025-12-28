@@ -2,7 +2,6 @@ import { SupabaseVectorStore } from '@langchain/community/vectorstores/supabase'
 import { createSupabaseClient } from '../helpers/supabaseClient.js'
 import { GoogleGenerativeAIEmbeddings } from '@langchain/google-genai'
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters'
-import { YoutubeTranscript } from 'youtube-transcript'
 
 // Helper function to extract video ID from YouTube URL
 function extractVideoId(url) {
@@ -18,7 +17,7 @@ function extractVideoId(url) {
   return null
 }
 
-// Helper function to get video title using oEmbed API (no API key needed)
+// Helper function to get video title using oEmbed API
 async function getVideoTitle(videoId) {
   try {
     const response = await fetch(
@@ -34,6 +33,256 @@ async function getVideoTitle(videoId) {
   return 'Unknown Title'
 }
 
+// Decode HTML entities
+function decodeHtmlEntities(text) {
+  if (!text) return ''
+  return text
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\\n/g, ' ')
+    .replace(/\n/g, ' ')
+    .trim()
+}
+
+// Parse caption XML with multiple regex patterns
+function parseCaptionXml(xml) {
+  const texts = []
+  
+  // Pattern 1: <text start="..." dur="...">content</text>
+  const pattern1 = /<text[^>]*>([^<]+)<\/text>/gi
+  let match
+  while ((match = pattern1.exec(xml)) !== null) {
+    const decoded = decodeHtmlEntities(match[1])
+    if (decoded) texts.push(decoded)
+  }
+  
+  if (texts.length > 0) {
+    console.log(`Pattern 1 matched: ${texts.length} segments`)
+    return texts.join(' ')
+  }
+  
+  // Pattern 2: Handle CDATA sections
+  const pattern2 = /<text[^>]*><!\[CDATA\[(.*?)\]\]><\/text>/gi
+  while ((match = pattern2.exec(xml)) !== null) {
+    const decoded = decodeHtmlEntities(match[1])
+    if (decoded) texts.push(decoded)
+  }
+  
+  if (texts.length > 0) {
+    console.log(`Pattern 2 (CDATA) matched: ${texts.length} segments`)
+    return texts.join(' ')
+  }
+  
+  // Pattern 3: JSON format (newer YouTube format)
+  try {
+    if (xml.includes('"events"')) {
+      const jsonData = JSON.parse(xml)
+      if (jsonData.events) {
+        for (const event of jsonData.events) {
+          if (event.segs) {
+            for (const seg of event.segs) {
+              if (seg.utf8) {
+                const decoded = decodeHtmlEntities(seg.utf8)
+                if (decoded && decoded !== '\n') texts.push(decoded)
+              }
+            }
+          }
+        }
+      }
+      if (texts.length > 0) {
+        console.log(`Pattern 3 (JSON) matched: ${texts.length} segments`)
+        return texts.join(' ')
+      }
+    }
+  } catch (e) {
+    // Not JSON format, continue
+  }
+  
+  // Pattern 4: Try to extract any text between tags
+  const pattern4 = />([^<]{2,})</g
+  while ((match = pattern4.exec(xml)) !== null) {
+    const decoded = decodeHtmlEntities(match[1])
+    if (decoded && !decoded.startsWith('<?') && !decoded.includes('encoding')) {
+      texts.push(decoded)
+    }
+  }
+  
+  if (texts.length > 0) {
+    console.log(`Pattern 4 (generic) matched: ${texts.length} segments`)
+    return texts.join(' ')
+  }
+  
+  return null
+}
+
+// Fetch transcript from YouTube
+async function fetchTranscript(videoId) {
+  try {
+    console.log('Fetching video page...')
+    
+    const watchUrl = `https://www.youtube.com/watch?v=${videoId}`
+    const response = await fetch(watchUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      }
+    })
+    
+    if (!response.ok) {
+      console.log(`Failed to fetch video page: ${response.status}`)
+      return null
+    }
+    
+    const html = await response.text()
+    
+    // Try to find captions in ytInitialPlayerResponse
+    const playerResponseMatch = html.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\});/)
+    
+    if (playerResponseMatch) {
+      try {
+        const playerData = JSON.parse(playerResponseMatch[1])
+        const captions = playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks
+        
+        if (captions && captions.length > 0) {
+          console.log(`Found ${captions.length} caption track(s)`)
+          
+          // Prefer English, then any available
+          let selectedTrack = captions.find(t => t.languageCode === 'en' && t.kind !== 'asr')
+            || captions.find(t => t.languageCode === 'en')
+            || captions.find(t => t.languageCode?.startsWith('en'))
+            || captions[0]
+          
+          if (selectedTrack?.baseUrl) {
+            const trackName = selectedTrack.name?.simpleText || selectedTrack.languageCode
+            const isAutoGenerated = selectedTrack.kind === 'asr' ? ' (auto-generated)' : ''
+            console.log(`Using caption track: ${trackName}${isAutoGenerated}`)
+            
+            // Fetch captions - try with fmt=json3 first (JSON format)
+            let captionUrl = selectedTrack.baseUrl
+            
+            // Try JSON format first
+            console.log('Trying JSON format (fmt=json3)...')
+            const jsonUrl = captionUrl + '&fmt=json3'
+            let captionResponse = await fetch(jsonUrl, {
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+              }
+            })
+            
+            if (captionResponse.ok) {
+              const captionData = await captionResponse.text()
+              console.log(`Caption response length: ${captionData.length} chars`)
+              
+              // Try to parse as JSON
+              try {
+                const jsonCaptions = JSON.parse(captionData)
+                if (jsonCaptions.events) {
+                  const texts = []
+                  for (const event of jsonCaptions.events) {
+                    if (event.segs) {
+                      for (const seg of event.segs) {
+                        if (seg.utf8 && seg.utf8.trim() && seg.utf8 !== '\n') {
+                          texts.push(seg.utf8.trim())
+                        }
+                      }
+                    }
+                  }
+                  if (texts.length > 0) {
+                    console.log(`✅ JSON format parsed: ${texts.length} segments`)
+                    return texts.join(' ')
+                  }
+                }
+              } catch (e) {
+                console.log('JSON parse failed, trying XML format...')
+              }
+            }
+            
+            // Fallback to XML format
+            console.log('Trying XML format...')
+            captionResponse = await fetch(captionUrl, {
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+              }
+            })
+            
+            if (captionResponse.ok) {
+              const captionXml = await captionResponse.text()
+              console.log(`Caption XML length: ${captionXml.length} chars`)
+              console.log(`First 500 chars: ${captionXml.substring(0, 500)}`)
+              
+              const transcript = parseCaptionXml(captionXml)
+              if (transcript) {
+                return transcript
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.log('Failed to parse ytInitialPlayerResponse:', e.message)
+      }
+    }
+    
+    // Fallback: Try regex to find caption tracks
+    const captionsRegex = /"captionTracks"\s*:\s*(\[[\s\S]*?\])\s*,\s*"/
+    const captionMatch = html.match(captionsRegex)
+    
+    if (captionMatch) {
+      try {
+        const captionTracks = JSON.parse(captionMatch[1])
+        if (captionTracks && captionTracks.length > 0) {
+          console.log(`Found ${captionTracks.length} caption track(s) via regex`)
+          
+          const selectedTrack = captionTracks[0]
+          if (selectedTrack?.baseUrl) {
+            const captionResponse = await fetch(selectedTrack.baseUrl + '&fmt=json3')
+            if (captionResponse.ok) {
+              const captionData = await captionResponse.text()
+              try {
+                const jsonCaptions = JSON.parse(captionData)
+                if (jsonCaptions.events) {
+                  const texts = []
+                  for (const event of jsonCaptions.events) {
+                    if (event.segs) {
+                      for (const seg of event.segs) {
+                        if (seg.utf8 && seg.utf8.trim() && seg.utf8 !== '\n') {
+                          texts.push(seg.utf8.trim())
+                        }
+                      }
+                    }
+                  }
+                  if (texts.length > 0) {
+                    console.log(`✅ Regex fallback parsed: ${texts.length} segments`)
+                    return texts.join(' ')
+                  }
+                }
+              } catch (e) {
+                // Try XML parsing
+                const transcript = parseCaptionXml(captionData)
+                if (transcript) return transcript
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.log('Regex caption parse failed:', e.message)
+      }
+    }
+    
+    console.log('No captions could be extracted')
+    return null
+    
+  } catch (error) {
+    console.log('Transcript fetch error:', error.message)
+    return null
+  }
+}
+
 export async function storeDocument(req) {
   try {
     if (!req?.body?.url) {
@@ -43,7 +292,6 @@ export async function storeDocument(req) {
     const { url, documentId } = req.body
     console.log(`📥 Processing document: ${url}`)
 
-    // Extract video ID
     const videoId = extractVideoId(url)
     if (!videoId) {
       throw new Error('Invalid YouTube URL. Could not extract video ID.')
@@ -53,7 +301,6 @@ export async function storeDocument(req) {
 
     const supabase = createSupabaseClient()
 
-    // Verify API key is available
     if (!process.env.GEMINI_API_KEY) {
       throw new Error('GEMINI_API_KEY is not configured in environment variables')
     }
@@ -71,38 +318,22 @@ export async function storeDocument(req) {
 
     console.log('🎥 Fetching YouTube transcript...')
 
-    let transcript
-    try {
-      transcript = await YoutubeTranscript.fetchTranscript(videoId)
-    } catch (transcriptError) {
-      console.error('Transcript Error:', transcriptError.message)
-      
-      if (transcriptError.message.includes('disabled') || 
-          transcriptError.message.includes('Transcript is disabled')) {
-        throw new Error('Transcripts are disabled for this video. Please try a video with captions enabled.')
-      }
-      
-      if (transcriptError.message.includes('not found') ||
-          transcriptError.message.includes('No transcript')) {
-        throw new Error('No transcript found for this video. Please try a video with captions/subtitles.')
-      }
+    const transcript = await fetchTranscript(videoId)
 
-      throw new Error(`Failed to fetch transcript: ${transcriptError.message}`)
+    if (!transcript || transcript.trim().length === 0) {
+      throw new Error(
+        'Could not fetch transcript for this video. ' +
+        'The video may not have captions, or they may be disabled. ' +
+        'Please try a different video with captions enabled.'
+      )
     }
 
-    if (!transcript || transcript.length === 0) {
-      throw new Error('No transcript content found for this video.')
-    }
+    console.log(`📄 Transcript length: ${transcript.length} characters`)
 
-    // Combine transcript segments into full text
-    const fullTranscript = transcript.map(segment => segment.text).join(' ')
-    
-    // Get video title
     const videoTitle = await getVideoTitle(videoId)
     console.log(`📝 Video Title: "${videoTitle}"`)
 
-    // Create document content with title
-    const pageContent = `Video title: ${videoTitle} | Video context: ${fullTranscript}`
+    const pageContent = `Video title: ${videoTitle} | Video context: ${transcript}`
 
     console.log('✂️ Splitting document into chunks...')
     const textSplitter = new RecursiveCharacterTextSplitter({
@@ -118,7 +349,6 @@ export async function storeDocument(req) {
 
     console.log(`📊 Created ${texts.length} text chunks`)
 
-    // Add document metadata to each chunk
     const docsWithMetaData = texts.map((text, index) => ({
       ...text,
       metadata: {
@@ -149,7 +379,7 @@ export async function storeDocument(req) {
     return {
       ok: false,
       error: error.message,
-      suggestion: 'Try using a video with captions enabled (educational videos usually have them).'
+      suggestion: 'Try using a video with captions enabled.'
     }
   }
 }
